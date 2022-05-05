@@ -10,12 +10,13 @@
 /// The main function, parse_body, is the only exported function.
 ///
 use multipart::server::Multipart;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::io::Read;
 use xmlparser::{ElementEnd, EntityDefinition, ExternalId, Token};
 
 use crate::config::raw::ContentType;
 use crate::config::utils::DataSource;
+use crate::interface::{Action, ActionType};
 use crate::logs::Logs;
 use crate::requestfields::RequestField;
 use crate::utils::decoders::parse_urlencoded_params_bytes;
@@ -36,14 +37,22 @@ fn json_path(prefix: &[String]) -> String {
 ///   * indices for lists.
 ///
 /// Scalar values are converted to string, with lowercase booleans and null values.
-fn flatten_json(args: &mut RequestField, prefix: &mut Vec<String>, value: Value) {
+fn flatten_json(
+    depth_budget: usize,
+    args: &mut RequestField,
+    prefix: &mut Vec<String>,
+    value: Value,
+) -> Result<(), ()> {
+    if depth_budget == 0 {
+        return Err(());
+    }
     match value {
         Value::Array(array) => {
             prefix.push(String::new());
             let idx = prefix.len() - 1;
             for (i, v) in array.into_iter().enumerate() {
                 prefix[idx] = format!("{}", i);
-                flatten_json(args, prefix, v);
+                flatten_json(depth_budget - 1, args, prefix, v)?;
             }
             prefix.pop();
         }
@@ -52,7 +61,7 @@ fn flatten_json(args: &mut RequestField, prefix: &mut Vec<String>, value: Value)
             let idx = prefix.len() - 1;
             for (k, v) in mp.into_iter() {
                 prefix[idx] = k;
-                flatten_json(args, prefix, v);
+                flatten_json(depth_budget - 1, args, prefix, v)?;
             }
             prefix.pop();
         }
@@ -73,6 +82,7 @@ fn flatten_json(args: &mut RequestField, prefix: &mut Vec<String>, value: Value)
             args.add(json_path(prefix), DataSource::FromBody, "null".to_string());
         }
     }
+    Ok(())
 }
 
 /// This should work with a stream of json items, not deserialize all at once
@@ -84,12 +94,11 @@ fn flatten_json(args: &mut RequestField, prefix: &mut Vec<String>, value: Value)
 ///  * map/10000 -> +33.534%
 ///
 /// next idea: adapting https://github.com/Geal/nom/blob/master/examples/json_iterator.rs
-fn json_body(args: &mut RequestField, body: &[u8]) -> Result<(), String> {
+fn json_body(mxdepth: usize, args: &mut RequestField, body: &[u8]) -> Result<(), String> {
     let value: Value = serde_json::from_slice(body).map_err(|rr| format!("Invalid JSON body: {}", rr))?;
 
     let mut prefix = Vec::new();
-    flatten_json(args, &mut prefix, value);
-    Ok(())
+    flatten_json(mxdepth, args, &mut prefix, value).map_err(|()| format!("JSON nesting level exceeded: {}", mxdepth))
 }
 
 /// builds the XML path for a given stack, by appending key names with their indices
@@ -178,10 +187,13 @@ fn xml_external_id(args: &mut RequestField, stack: &[(String, u64)], name: &str,
 /// This checks the following errors, in addition to the what the lexer gets:
 ///   * mismatched opening and closing tags
 ///   * premature end of document
-fn xml_body(args: &mut RequestField, body: &[u8]) -> Result<(), String> {
+fn xml_body(mxdepth: usize, args: &mut RequestField, body: &[u8]) -> Result<(), String> {
     let body_utf8 = String::from_utf8_lossy(body);
     let mut stack: Vec<(String, u64)> = Vec::new();
     for rtoken in xmlparser::Tokenizer::from(body_utf8.as_ref()) {
+        if stack.len() >= mxdepth {
+            return Err(format!("XML nesting level exceeded: {}", mxdepth));
+        }
         let token = rtoken.map_err(|rr| format!("XML parsing error: {}", rr))?;
         match token {
             Token::ProcessingInstruction { .. } => (),
@@ -267,11 +279,16 @@ fn multipart_form_encoded(boundary: &str, args: &mut RequestField, body: &[u8]) 
 pub fn parse_body(
     logs: &mut Logs,
     args: &mut RequestField,
+    max_depth: usize,
     mcontent_type: Option<&str>,
     accepted_types: &[ContentType],
     body: &[u8],
 ) -> Result<(), String> {
     logs.debug("body parsing started");
+    if max_depth == 0 {
+        logs.warning("max_depth is 0, body parsing avoided");
+        return Ok(());
+    }
 
     let active_accepted_types = if accepted_types.is_empty() {
         &ContentType::VALUES
@@ -284,12 +301,12 @@ pub fn parse_body(
             match t {
                 ContentType::Graphql => {
                     if content_type == "application/graphql" {
-                        return graphql::graphql_body(args, body);
+                        return graphql::graphql_body(max_depth, args, body);
                     }
                 }
                 ContentType::Json => {
                     if content_type.ends_with("/json") {
-                        return json_body(args, body);
+                        return json_body(max_depth, args, body);
                     }
                 }
                 ContentType::MultipartForm => {
@@ -299,7 +316,7 @@ pub fn parse_body(
                 }
                 ContentType::Xml => {
                     if content_type.ends_with("/xml") {
-                        return xml_body(args, body);
+                        return xml_body(max_depth, args, body);
                     }
                 }
                 ContentType::UrlEncoded => {
@@ -316,13 +333,47 @@ pub fn parse_body(
     // content-type not found
     if accepted_types.is_empty() {
         // we had no particular expection, so blindly try json, and urlencoded
-        json_body(args, body).or_else(|_| forms_body(args, body))
+        json_body(max_depth, args, body).or_else(|_| forms_body(args, body))
     } else {
         // we expected a specific content type!
         Err(format!(
             "Invalid content type={:?}, accepted types={:?}",
             mcontent_type, accepted_types
         ))
+    }
+}
+
+pub fn body_too_deep(expected: usize, actual: usize) -> Action {
+    Action {
+        atype: ActionType::Block,
+        block_mode: true,
+        ban: false,
+        status: 403,
+        headers: None,
+        reason: json!({
+            "initiator": "body_max_depth",
+            "expected": expected,
+            "actual": actual
+        }),
+        content: "Access denied".to_string(),
+        extra_tags: None,
+    }
+}
+
+pub fn body_too_large(expected: usize, actual: usize) -> Action {
+    Action {
+        atype: ActionType::Block,
+        block_mode: true,
+        ban: false,
+        status: 403,
+        headers: None,
+        reason: json!({
+            "initiator": "body_max_size",
+            "expected": expected,
+            "actual": actual
+        }),
+        content: "Access denied".to_string(),
+        extra_tags: None,
     }
 }
 
@@ -337,10 +388,11 @@ mod tests {
         mcontent_type: Option<&str>,
         accepted_types: &[ContentType],
         body: &[u8],
+        max_depth: usize,
     ) -> RequestField {
         let mut logs = Logs::default();
         let mut args = RequestField::new(dec);
-        parse_body(&mut logs, &mut args, mcontent_type, accepted_types, body).unwrap();
+        parse_body(&mut logs, &mut args, max_depth, mcontent_type, accepted_types, body).unwrap();
         for lg in logs.logs {
             if lg.level > LogLevel::Debug {
                 panic!("unexpected log: {:?}", lg);
@@ -349,10 +401,10 @@ mod tests {
         args
     }
 
-    fn test_parse_bad(mcontent_type: Option<&str>, accepted_types: &[ContentType], body: &[u8]) {
+    fn test_parse_bad(mcontent_type: Option<&str>, accepted_types: &[ContentType], body: &[u8], max_depth: usize) {
         let mut logs = Logs::default();
         let mut args = RequestField::new(&[]);
-        assert!(parse_body(&mut logs, &mut args, mcontent_type, accepted_types, body).is_err());
+        assert!(parse_body(&mut logs, &mut args, max_depth, mcontent_type, accepted_types, body).is_err());
     }
 
     fn test_parse_dec(
@@ -362,7 +414,7 @@ mod tests {
         body: &[u8],
         expected: &[(&str, &str)],
     ) {
-        let args = test_parse_ok_dec(dec, mcontent_type, accepted_types, body);
+        let args = test_parse_ok_dec(dec, mcontent_type, accepted_types, body, 500);
         for (k, v) in expected {
             match args.get_str(k) {
                 None => panic!("Argument not set {}", k),
@@ -416,7 +468,7 @@ mod tests {
 
     #[test]
     fn json_bad() {
-        test_parse_bad(Some("application/json"), &[], br#"{"a": "b""#);
+        test_parse_bad(Some("application/json"), &[], br#"{"a": "b""#, 500);
     }
 
     #[test]
@@ -450,6 +502,7 @@ mod tests {
         parse_body(
             &mut logs,
             &mut args,
+            500,
             Some("application/json"),
             &[],
             br#"{"a": "body_arg"}"#,
@@ -498,17 +551,17 @@ mod tests {
 
     #[test]
     fn xml_bad1() {
-        test_parse_bad(Some("text/xml"), &[], br#"<a>"#);
+        test_parse_bad(Some("text/xml"), &[], br#"<a>"#, 500);
     }
 
     #[test]
     fn xml_bad2() {
-        test_parse_bad(Some("text/xml"), &[], br#"<a>x</b>"#);
+        test_parse_bad(Some("text/xml"), &[], br#"<a>x</b>"#, 500);
     }
 
     #[test]
     fn xml_bad3() {
-        test_parse_bad(Some("text/xml"), &[], br#"<a 1x="12">x</a>"#);
+        test_parse_bad(Some("text/xml"), &[], br#"<a 1x="12">x</a>"#, 500);
     }
 
     #[test]
@@ -597,6 +650,16 @@ mod tests {
     }
 
     #[test]
+    fn xml_indent_too_deep() {
+        test_parse_bad(Some("text/xml"), &[], br#"<a>x1<b>x2</b></a>"#, 2);
+    }
+
+    #[test]
+    fn xml_indent_depth_ok() {
+        test_parse_ok_dec(&[], Some("text/xml"), &[], br#"<a>x1<b>x2</b></a>"#, 3);
+    }
+
+    #[test]
     fn multipart() {
         let content = [
             "--------------------------28137e3917e320b3",
@@ -649,17 +712,17 @@ mod tests {
 
     #[test]
     fn json_but_expect_json_noct() {
-        test_parse_bad(None, &[ContentType::Json], br#"{"a": "b", "c": "d"}"#);
+        test_parse_bad(None, &[ContentType::Json], br#"{"a": "b", "c": "d"}"#, 500);
     }
 
     #[test]
     fn json_but_expect_xml_ct() {
-        test_parse_bad(Some("text/xml"), &[ContentType::Json], br#"{"a": "b", "c": "d"}"#);
+        test_parse_bad(Some("text/xml"), &[ContentType::Json], br#"{"a": "b", "c": "d"}"#, 500);
     }
 
     #[test]
     fn json_but_expect_xml_noct() {
-        test_parse_bad(None, &[ContentType::Json], br#"{"a": "b", "c": "d"}"#);
+        test_parse_bad(None, &[ContentType::Json], br#"{"a": "b", "c": "d"}"#, 500);
     }
 
     #[test]
@@ -789,5 +852,50 @@ mod tests {
               }"#,
             &[("gdir-s0-allUsers-id", "1337"), ("gdir-s0-allUsers-s0", "name")],
         );
+    }
+
+    #[test]
+    fn graphql_too_much_nesting() {
+        test_parse_bad(
+            Some("application/graphql"),
+            &[ContentType::Graphql],
+            br#"query {
+                allUsers(id: 1337) {
+                  name
+                }
+              }"#,
+            2,
+        );
+    }
+
+    #[test]
+    fn json_indent_too_deep_array() {
+        test_parse_bad(Some("application/json"), &[], br#"[["a"]]"#, 2);
+    }
+
+    #[test]
+    fn json_indent_too_deep_dict() {
+        test_parse_bad(Some("application/json"), &[], br#"{"k":{"v":"a"}}"#, 2);
+    }
+
+    #[test]
+    fn json_indent_depth_ok() {
+        test_parse_ok_dec(&[], Some("application/json"), &[], br#"[["a"]]"#, 3);
+    }
+
+    #[test]
+    fn urlencoded_depth_0() {
+        let mut logs = Logs::default();
+        let mut args = RequestField::new(&[]);
+        parse_body(
+            &mut logs,
+            &mut args,
+            0,
+            Some("application/x-www-form-urlencoded"),
+            &[],
+            b"a=1&b=2&c=3",
+        )
+        .unwrap();
+        assert!(args.is_empty())
     }
 }

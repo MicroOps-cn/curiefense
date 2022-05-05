@@ -277,6 +277,8 @@ pub struct RawContentFilterProfile {
     pub masking_seed: String,
     #[serde(default)]
     pub content_type: Vec<ContentType>,
+    pub max_body_size: Option<usize>,
+    pub max_body_depth: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

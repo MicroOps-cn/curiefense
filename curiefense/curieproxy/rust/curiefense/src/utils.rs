@@ -73,6 +73,7 @@ fn map_args(
     mcontent_type: Option<&str>,
     accepted_types: &[ContentType],
     mbody: Option<&[u8]>,
+    max_depth: usize,
 ) -> QueryInfo {
     // this is necessary to do this in this convoluted way so at not to borrow attrs
     let uri = match urldecode_str(path) {
@@ -85,7 +86,7 @@ fn map_args(
     };
 
     let body_decoding = if let Some(body) = mbody {
-        if let Err(rr) = parse_body(logs, &mut args, mcontent_type, accepted_types, body) {
+        if let Err(rr) = parse_body(logs, &mut args, max_depth, mcontent_type, accepted_types, body) {
             logs.debug(|| format!("Body parsing failed: {}", rr));
             // if the body could not be parsed, store it in an argument, as if it was text
             args.add(
@@ -396,6 +397,7 @@ pub fn map_request(
     logs: &mut Logs,
     dec: &[Transformation],
     accepted_types: &[ContentType],
+    max_depth: usize, // if set to 0, the body will not be parsed
     raw: &RawRequest,
 ) -> RequestInfo {
     let host = raw.get_host();
@@ -412,6 +414,7 @@ pub fn map_request(
         headers.get_str("content-type"),
         accepted_types,
         raw.mbody,
+        max_depth,
     );
     logs.debug("args mapped");
 
@@ -508,6 +511,7 @@ mod tests {
             None,
             &[],
             None,
+            500,
         );
 
         assert_eq!(qinfo.qpath, "/a/b/%20c");
@@ -533,7 +537,7 @@ mod tests {
     #[test]
     fn test_map_args_simple() {
         let mut logs = Logs::default();
-        let qinfo = map_args(&mut logs, &[], "/a/b", None, &[], None);
+        let qinfo = map_args(&mut logs, &[], "/a/b", None, &[], None, 500);
 
         assert_eq!(qinfo.qpath, "/a/b");
         assert_eq!(qinfo.uri, "/a/b");

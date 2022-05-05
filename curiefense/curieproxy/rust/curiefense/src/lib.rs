@@ -17,6 +17,7 @@ pub mod simple_executor;
 pub mod tagging;
 pub mod utils;
 
+use body::body_too_large;
 use config::{with_config, HSDB};
 use contentfilter::content_filter_check;
 use grasshopper::Grasshopper;
@@ -91,6 +92,13 @@ pub async fn inspect_generic_request_map_async<GH: Grasshopper>(
 
     logs.debug(|| format!("Inspection starts (grasshopper active: {})", mgh.is_some()));
 
+    #[allow(clippy::large_enum_variant)]
+    enum RequestMappingResult<A> {
+        NoSecurityPolicy,
+        BodyTooLarge(Action, RequestInfo),
+        Res(A),
+    }
+
     // do all config queries in the lambda once
     // there is a lot of copying taking place, to minimize the lock time
     // this decision should be backed with benchmarks
@@ -101,12 +109,40 @@ pub async fn inspect_generic_request_map_async<GH: Grasshopper>(
                 match_securitypolicy(&raw.get_host(), &raw.meta.path, cfg, slogs).map(|(nm, um)| (nm, um.clone()));
             match mmapinfo {
                 Some((nm, secpolicy)) => {
+                    // this part is where we use the configuration as much as possible, while we have a lock on it
+                    let pmax_depth = secpolicy.content_filter_profile.max_body_depth;
+
+                    // check if the body is too large
+                    // if the body is too large, we store the "too large" action for later use, and set the max depth to 0
+                    let (body_too_large, max_depth) = if let Some(body) = raw.mbody {
+                        if body.len() > secpolicy.content_filter_profile.max_body_size {
+                            (
+                                Some(body_too_large(
+                                    secpolicy.content_filter_profile.max_body_size,
+                                    body.len(),
+                                )),
+                                0,
+                            )
+                        } else {
+                            (None, pmax_depth)
+                        }
+                    } else {
+                        (None, pmax_depth)
+                    };
+
+                    // if the max depth is equal to 0, the body will not be parsed
                     let reqinfo = map_request(
                         slogs,
                         &secpolicy.content_filter_profile.decoding,
                         &secpolicy.content_filter_profile.content_type,
+                        max_depth,
                         &raw,
                     );
+
+                    if let Some(action) = body_too_large {
+                        return RequestMappingResult::BodyTooLarge(action, reqinfo);
+                    }
+
                     let nflows = cfg.flows.clone();
 
                     // without grasshopper, default to being human
@@ -117,22 +153,22 @@ pub async fn inspect_generic_request_map_async<GH: Grasshopper>(
                     };
 
                     let ntags = tag_request(is_human, &cfg.globalfilters, &reqinfo);
-                    Some(((nm, secpolicy), ntags, nflows, reqinfo, is_human))
+                    RequestMappingResult::Res(((nm, secpolicy), ntags, nflows, reqinfo, is_human))
                 }
-                None => {
-                    slogs.error("Could not find a security policy");
-                    None
-                }
+                None => RequestMappingResult::NoSecurityPolicy,
             }
         }) {
-            Some(Some(x)) => x,
-            Some(None) => {
-                logs.debug("Something went wrong during request tagging");
-                return (Decision::Pass, tags, map_request(logs, &[], &[], &raw));
+            Some(RequestMappingResult::Res(x)) => x,
+            Some(RequestMappingResult::BodyTooLarge(action, rinfo)) => {
+                return (Decision::Action(action), tags, rinfo);
+            }
+            Some(RequestMappingResult::NoSecurityPolicy) => {
+                logs.debug("No security policy found");
+                return (Decision::Pass, tags, map_request(logs, &[], &[], 0, &raw));
             }
             None => {
                 logs.debug("Something went wrong during security policy searching");
-                return (Decision::Pass, tags, map_request(logs, &[], &[], &raw));
+                return (Decision::Pass, tags, map_request(logs, &[], &[], 0, &raw));
             }
         };
 
@@ -166,11 +202,23 @@ pub fn content_filter_check_generic_request_map(
         Some(Some(prof)) => prof,
         _ => {
             logs.error("Content Filter profile not found");
-            return (Decision::Pass, map_request(logs, &[], &[], raw), tags);
+            return (Decision::Pass, map_request(logs, &[], &[], 25, raw), tags);
         }
     };
 
-    let reqinfo = map_request(logs, &waf_profile.decoding, &[], raw);
+    if let Some(body) = raw.mbody {
+        if body.len() > waf_profile.max_body_size {
+            logs.error("body too large, exiting early");
+            let reqinfo = map_request(logs, &waf_profile.decoding, &[], 0, raw);
+            return (
+                Decision::Action(body_too_large(waf_profile.max_body_size, body.len())),
+                reqinfo,
+                tags,
+            );
+        }
+    }
+
+    let reqinfo = map_request(logs, &waf_profile.decoding, &[], waf_profile.max_body_depth, raw);
 
     let waf_result = match HSDB.read() {
         Ok(rd) => content_filter_check(logs, &mut tags, &reqinfo, &waf_profile, rd.get(content_filter_id)),

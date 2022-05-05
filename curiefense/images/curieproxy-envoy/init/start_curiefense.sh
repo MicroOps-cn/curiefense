@@ -10,8 +10,10 @@ then
 	ln -s bootstrap /cf-config/current
 fi
 
-TADDR="${TARGET_ADDRESS:-echo}"
-TPORT="${TARGET_PORT:-8080}"
+TADDRA="${TARGET_ADDRESS_A:-echo}"
+TPORTA="${TARGET_PORT_A:-8080}"
+TADDRB="${TARGET_ADDRESS_B:-juicebox}"
+TPORTB="${TARGET_PORT_B:-3000}"
 XFF="${XFF_TRUSTED_HOPS:-1}"
 ENVOY_LOG_LEVEL="${ENVOY_LOG_LEVEL:-error}"
 
@@ -19,7 +21,7 @@ sed -e "s/XFF_TRUSTED/$XFF/" /etc/envoy/envoy.yaml.head > /etc/envoy/envoy.yaml
 if [ -f /run/secrets/curieproxysslcrt ]; then
 	cat /etc/envoy/envoy.yaml.tls >> /etc/envoy/envoy.yaml
 fi
-sed -e "s/TARGET_ADDRESS/$TADDR/" -e "s/TARGET_PORT/$TPORT/" /etc/envoy/envoy.yaml.tail >> /etc/envoy/envoy.yaml
+sed -e "s/TARGET_ADDRESS_A/$TADDRA/" -e "s/TARGET_PORT_A/$TPORTA/" -e "s/TARGET_ADDRESS_B/$TADDRB/" -e "s/TARGET_PORT_B/$TPORTB/" /etc/envoy/envoy.yaml.tail >> /etc/envoy/envoy.yaml
 
 while true
 do

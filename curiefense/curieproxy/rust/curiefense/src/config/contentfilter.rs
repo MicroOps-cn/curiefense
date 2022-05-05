@@ -33,6 +33,8 @@ pub struct ContentFilterProfile {
     pub decoding: Vec<Transformation>,
     pub masking_seed: Vec<u8>,
     pub content_type: Vec<ContentType>,
+    pub max_body_size: usize,
+    pub max_body_depth: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +83,8 @@ impl ContentFilterProfile {
             ignore: HashSet::default(),
             report: HashSet::default(),
             content_type: Vec::new(),
+            max_body_size: usize::MAX,
+            max_body_depth: usize::MAX,
         }
     }
 }
@@ -235,6 +239,8 @@ fn convert_entry(entry: RawContentFilterProfile) -> anyhow::Result<(String, Cont
             ignore: entry.ignore.into_iter().collect(),
             report: entry.report.into_iter().collect(),
             content_type: entry.content_type,
+            max_body_size: entry.max_body_size.unwrap_or(usize::MAX),
+            max_body_depth: entry.max_body_depth.unwrap_or(usize::MAX),
         },
     ))
 }
