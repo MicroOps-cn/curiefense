@@ -1,5 +1,7 @@
 #!/bin/bash
+# This script is to avoid the test failure caused by the unsynchronized update of the curiefense-helm repository.
 
-/bootstrap/initial-bucket-export.sh 1>/dev/stdout 2>/dev/stderr &
-
-/usr/sbin/nginx -g 'daemon off;'
+while true;do
+  echo "Discarded..."
+  sleep 60
+done

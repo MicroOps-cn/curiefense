@@ -6,9 +6,7 @@ FROM envoyproxy/envoy:v1.21.1
 RUN apt-get update && \
     apt-get -qq -y --no-install-recommends install jq luarocks libpcre2-dev libgeoip-dev \
     python gcc g++ make unzip libhyperscan4 libhyperscan-dev && \
-    rm -rf /var/lib/apt/lists/*
-
-RUN luarocks install lrexlib-pcre2 && \
+    luarocks install lrexlib-pcre2 && \
     luarocks install lua-cjson && \
     luarocks install lua-resty-string && \
     luarocks install luafilesystem && \
@@ -17,7 +15,10 @@ RUN luarocks install lrexlib-pcre2 && \
     luarocks install compat53 && \
     luarocks install mmdblua && \
     luarocks install luaipc && \
-    luarocks install lua-resty-injection
+    luarocks install lua-resty-injection && \
+    apt-get purge -y jq luarocks libpcre2-dev libgeoip-dev python \
+    gcc g++ make unzip libhyperscan-dev && apt-get autoremove --purge -y && \
+    rm -rf /var/lib/apt/lists/*
 
 # Overwrite stripped envoy with full symbol
 COPY --from=envoy-cf /envoy /usr/local/bin/envoy
